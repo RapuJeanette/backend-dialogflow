@@ -1,26 +1,20 @@
+import re
 from flask import Flask, request, jsonify
 from google.cloud import dialogflow_v2 as dialogflow
 from tuya_connector import TuyaOpenAPI
 import os
 import uuid
-import requests
-import time
-import hashlib
-import hmac
 
 app = Flask(__name__)
 
+# Configuración de Dialogflow y Tuya
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "dialogflow_key.json"
-DIALOGFLOW_PROJECT_ID = "controlvoz-vwye"  # <-- Asegúrate que esté correcto
-
-ACCESS_ID = "ajyqpwwctqukna5rk3gr"
-ACCESS_KEY = "31b4f4248afb495ca42113048c587715"
-API_ENDPOINT = "https://openapi.tuyaus.com"
-MQ_ENDPOINT = "wss://mqe.tuyaus.com:8285/"
-DEVICE_ID = "eb0d182f5aac27e0bfwolo"
+DIALOGFLOW_PROJECT_ID = "controlvoz-vwye"
 
 estado_foco = {
-    "encendido": False
+    "encendido": False,
+    "color": None,   # p.ej. "azul"
+    "intensidad": 100  # porcentaje 1-100
 }
 
 openapi = TuyaOpenAPI(API_ENDPOINT, ACCESS_ID, ACCESS_KEY)
@@ -35,35 +29,49 @@ COLOR_MAP = {
     "violeta": 270
 }
 
-INTENSIDAD_MAP = {
-    "baja": 20,
-    "media": 500,
-    "alta": 1000
-}
-
 def controlar_foco_real(encender=None, color=None, intensidad=None):
     comandos = []
 
-    if encender is not None:
-        comandos.append({"code": "switch_led", "value": encender})
+    # Actualizar estado si viene color/intensidad nuevos
+    if color:
+        estado_foco["color"] = color
 
-    if intensidad and intensidad in INTENSIDAD_MAP:
-        comandos.append({"code": "bright_value_v2", "value": INTENSIDAD_MAP[intensidad]})
+    if intensidad is not None:
+        try:
+            intensidad = int(intensidad)
+            intensidad = max(1, min(100, intensidad))
+            estado_foco["intensidad"] = intensidad
+        except:
+            pass
 
-    if color and color in COLOR_MAP:
-        hue = COLOR_MAP[color]
+    # Si hay color en estado, mandar modo color y color_data con brillo actual
+    if estado_foco["color"]:
+        comandos.append({"code": "work_mode", "value": "colour"})
+        hue = COLOR_MAP.get(estado_foco["color"], 0)
+        brillo_tuya = int((estado_foco["intensidad"] / 100) * 1000)
         comandos.append({
             "code": "colour_data_v2",
             "value": {
                 "h": hue,
                 "s": 1000,
-                "v": 1000
+                "v": brillo_tuya
             }
         })
+    else:
+        # Si no hay color (modo blanco), mandar solo brillo con bright_value_v2
+        brillo_tuya = int((estado_foco["intensidad"] / 100) * 1000)
+        comandos.append({"code": "bright_value_v2", "value": brillo_tuya})
+
+    # Comando switch_led si viene
+    if encender is not None:
+        comandos.append({"code": "switch_led", "value": encender})
+        estado_foco["encendido"] = encender
 
     if not comandos:
         print("⚠️ No hay comandos para enviar a Tuya.")
         return False
+
+    print("📤 Enviando comandos a Tuya:", comandos)
 
     try:
         response = openapi.post(f"/v1.0/iot-03/devices/{DEVICE_ID}/commands", {"commands": comandos})
@@ -72,8 +80,7 @@ def controlar_foco_real(encender=None, color=None, intensidad=None):
     except Exception as e:
         print("❌ Error enviando comando a Tuya:", e)
         return False
-
-# Ruta principal: procesar mensaje desde Flutter
+    
 @app.route("/dialogflow", methods=["POST"])
 def procesar_texto():
     data = request.get_json()
@@ -96,19 +103,60 @@ def procesar_texto():
         parameters = response.query_result.parameters
 
         color = parameters.get("color")
-        intensidad = parameters.get("intensidad")
+        intensidad_raw = parameters.get("intensidad_porcentaje")
+        print(f"DEBUG => intensidad_raw recibido: {intensidad_raw}")
+        intensidad = None
+        if isinstance(intensidad_raw, dict):
+            intensidad = intensidad_raw.get("amount")
+        elif isinstance(intensidad_raw, (int, float)):
+            intensidad = intensidad_raw
+        elif isinstance(intensidad_raw, str):
+    # Extraer solo números del string
+            numeros = re.findall(r'\d+', intensidad_raw)
+            if numeros:
+                intensidad = int(numeros[0])
+
+        print(f"DEBUG => intensidad procesada: {intensidad}")
+
+        if intensidad is not None:
+            # Validar rango y pasar a string para tu función
+            intensidad = max(1, min(100, int(intensidad)))
 
         encender = None
 
-        # 🔁 Procesar acciones desde Dialogflow
         if action in ["encender", "luces.encender"]:
             encender = True
             estado_foco["encendido"] = True
+
         elif action in ["apagar", "luces.apagar"]:
             encender = False
             estado_foco["encendido"] = False
 
-        # Ejecutar comando
+        elif action == "luces.modificar_intensidad":
+            encender = True
+            estado_foco["encendido"] = True
+
+        elif action == "luces.modificar_color":
+            encender = True
+            estado_foco["encendido"] = True
+
+        elif action == "luces.modificar_completo":
+            encender = True
+            estado_foco["encendido"] = True
+
+        elif action == "encenderluzcolor":
+            encender = True
+            estado_foco["encendido"] = True
+
+        elif action == "encenderluzcolorintensidad":
+            encender = True
+            estado_foco["encendido"] = True
+
+        elif action == "encenderluzintensidad":
+            encender = True
+            estado_foco["encendido"] = True
+
+        print(f"DEBUG => acción: {action}, color: {color}, intensidad: {intensidad}, encender: {encender}")
         controlar_foco_real(encender=encender, color=color, intensidad=intensidad)
 
         return jsonify({
@@ -121,26 +169,21 @@ def procesar_texto():
         print("❌ Error:", e)
         return jsonify({"error": "No se pudo conectar a Dialogflow"}), 500
 
-
-# ✅ Consultar estado del foco
 @app.route("/foco/estado", methods=["GET"])
 def estado():
     return jsonify({"encendido": estado_foco["encendido"]})
 
-# 🔘 Encender foco manualmente
 @app.route("/foco/encender", methods=["POST"])
 def encender():
     estado_foco["encendido"] = True
     controlar_foco_real(encender=True)
     return jsonify({"mensaje": "Foco encendido", "encendido": True})
 
-# 🔌 Apagar foco manualmente
 @app.route("/foco/apagar", methods=["POST"])
 def apagar():
     estado_foco["encendido"] = False
     controlar_foco_real(encender=False)
     return jsonify({"mensaje": "Foco apagado", "encendido": False})
 
-# ▶️ Ejecutar servidor
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
